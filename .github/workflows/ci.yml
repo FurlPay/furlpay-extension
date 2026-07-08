@@ -3,13 +3,15 @@ on:
   push: { branches: [main] }
   pull_request:
 jobs:
-  test:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
-      - name: Syntax-check scripts
-        run: node --check src/background.js && node --check src/content.js && node --check src/popup/popup.js
-      - name: Validate manifest
-        run: node -e "JSON.parse(require('fs').readFileSync('manifest.json','utf8')); console.log('manifest OK')"
+      - name: Install dependencies
+        run: npm install
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build (Chrome MV3)
+        run: npm run build
