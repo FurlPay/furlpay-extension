@@ -2,14 +2,15 @@
 // On checkout-looking pages, shows a small dismissible pill comparing typical
 // card processing cost (~2.9% + $0.30) against FurlPay's 0.5% flat.
 // Heuristics only, read-only, shadow-DOM isolated; never touches page forms.
+// Money math + total-selection logic live in @/lib/fees (unit-tested).
 
-const CHECKOUT_HINTS = /checkout|payment|cart|billing|order|book(ing)?/i;
-const CARD_FEE_PCT = 0.029;
-const CARD_FEE_FIXED = 0.3;
-const FURLPAY_FEE_PCT = 0.005;
+import { AmountCandidate, CHECKOUT_HINTS, compareFees, extractAmounts, pickTotal } from "@/lib/fees";
 
 export default defineContentScript({
-  matches: ["<all_urls>"],
+  // http(s) only — never chrome://, chrome-extension://, about:, file://
+  // (G4: CWS reviewers flag <all_urls> on scanners; web pages are the only
+  // place a checkout total can exist anyway).
+  matches: ["https://*/*", "http://*/*"],
   runAt: "document_idle",
   main() {
     if (!CHECKOUT_HINTS.test(location.href) && !CHECKOUT_HINTS.test(document.title)) return;
@@ -31,8 +32,7 @@ export default defineContentScript({
  *  falling back to the largest dollar amount on the page. */
 function detectTotal(): number | null {
   if (!document.body) return null;
-  const amountRe = /(?:\$|USD\s?)(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)/g;
-  const candidates: { value: number; weighted: boolean }[] = [];
+  const candidates: AmountCandidate[] = [];
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   let node: Node | null;
   let scanned = 0;
@@ -40,24 +40,14 @@ function detectTotal(): number | null {
     scanned += 1;
     const text = node.textContent ?? "";
     if (text.length > 200) continue;
-    let m: RegExpExecArray | null;
-    while ((m = amountRe.exec(text))) {
-      const value = parseFloat(m[1].replace(/,/g, ""));
-      if (!Number.isFinite(value) || value <= 0 || value > 100_000) continue;
-      const context = (node.parentElement?.textContent ?? "").slice(0, 120).toLowerCase();
-      candidates.push({ value, weighted: /total|amount due|pay/.test(context) });
-    }
+    candidates.push(...extractAmounts(text, node.parentElement?.textContent ?? ""));
   }
-  if (!candidates.length) return null;
-  const weighted = candidates.filter((c) => c.weighted);
-  const pool = weighted.length ? weighted : candidates;
-  return Math.max(...pool.map((c) => c.value));
+  return pickTotal(candidates);
 }
 
 function renderPill(total: number | null) {
-  const cardFee = total !== null ? total * CARD_FEE_PCT + CARD_FEE_FIXED : null;
-  const furlFee = total !== null ? total * FURLPAY_FEE_PCT : null;
-  const saving = cardFee !== null && furlFee !== null ? cardFee - furlFee : null;
+  const fees = total !== null ? compareFees(total) : null;
+  const saving = fees?.saving ?? null;
 
   const host = document.createElement("div");
   host.style.cssText = "all: initial; position: fixed; right: 16px; bottom: 16px; z-index: 2147483646;";
@@ -84,27 +74,70 @@ function renderPill(total: number | null) {
     saving !== null
       ? `Cards cost ~$${saving.toFixed(2)} more here. FurlPay: 0.5%`
       : "This checkout charges ~2.9% card fees. FurlPay: 0.5%";
-  wrap.innerHTML = `
-    <div class="pill" role="button">
-      <span class="dot"></span>
-      <span>${message}</span>
-      <button class="x" type="button" aria-label="Dismiss">&times;</button>
-    </div>
-    <div class="detail">
-      ${
-        total !== null
-          ? `<div>Order total: <strong>$${total.toFixed(2)}</strong></div>
-             <div>Typical card cost (2.9% + $0.30): <strong>$${(total * CARD_FEE_PCT + CARD_FEE_FIXED).toFixed(2)}</strong></div>
-             <div>FurlPay stablecoin checkout (0.5%): <strong>$${(total * FURLPAY_FEE_PCT).toFixed(2)}</strong></div>`
-          : `<div>FurlPay settles in USDC on Arbitrum for a flat <strong>0.5%</strong> — no interchange, no decline fees.</div>`
-      }
-      <a class="cta" href="https://furlpay.com/pricing" target="_blank" rel="noreferrer">See merchant pricing</a>
-    </div>
-  `;
 
-  const detail = wrap.querySelector<HTMLDivElement>(".detail")!;
-  wrap.querySelector<HTMLDivElement>(".pill")!.addEventListener("click", () => detail.classList.toggle("open"));
-  wrap.querySelector<HTMLButtonElement>(".x")!.addEventListener("click", async (e) => {
+  // --- Pill row (safe DOM API — no innerHTML) ---
+  const pill = document.createElement("div");
+  pill.className = "pill";
+  pill.setAttribute("role", "button");
+
+  const dot = document.createElement("span");
+  dot.className = "dot";
+  pill.appendChild(dot);
+
+  const msgSpan = document.createElement("span");
+  msgSpan.textContent = message;
+  pill.appendChild(msgSpan);
+
+  const dismissBtn = document.createElement("button");
+  dismissBtn.className = "x";
+  dismissBtn.type = "button";
+  dismissBtn.setAttribute("aria-label", "Dismiss");
+  dismissBtn.textContent = "\u00D7"; // ×
+  pill.appendChild(dismissBtn);
+
+  wrap.appendChild(pill);
+
+  // --- Detail panel ---
+  const detail = document.createElement("div");
+  detail.className = "detail";
+
+  /** Helper: creates <div>label <strong>value</strong></div> */
+  const infoLine = (label: string, value: string): HTMLDivElement => {
+    const row = document.createElement("div");
+    row.appendChild(document.createTextNode(label));
+    const strong = document.createElement("strong");
+    strong.textContent = value;
+    row.appendChild(strong);
+    return row;
+  };
+
+  if (total !== null && fees !== null) {
+    detail.appendChild(infoLine("Order total: ", `$${total.toFixed(2)}`));
+    detail.appendChild(infoLine("Typical card cost (2.9% + $0.30): ", `$${fees.cardFee.toFixed(2)}`));
+    detail.appendChild(infoLine("FurlPay stablecoin checkout (0.5%): ", `$${fees.furlFee.toFixed(2)}`));
+  } else {
+    const fallback = document.createElement("div");
+    fallback.appendChild(document.createTextNode("FurlPay settles in USDC on Arbitrum for a flat "));
+    const strong = document.createElement("strong");
+    strong.textContent = "0.5%";
+    fallback.appendChild(strong);
+    fallback.appendChild(document.createTextNode(" \u2014 no interchange, no decline fees."));
+    detail.appendChild(fallback);
+  }
+
+  const cta = document.createElement("a");
+  cta.className = "cta";
+  cta.href = "https://furlpay.com/pricing";
+  cta.target = "_blank";
+  cta.rel = "noreferrer";
+  cta.textContent = "See merchant pricing";
+  detail.appendChild(cta);
+
+  wrap.appendChild(detail);
+
+  // --- Event listeners ---
+  pill.addEventListener("click", () => detail.classList.toggle("open"));
+  dismissBtn.addEventListener("click", async (e) => {
     e.stopPropagation();
     const { feeScannerDismissed } = await browser.storage.local.get("feeScannerDismissed");
     await browser.storage.local.set({
