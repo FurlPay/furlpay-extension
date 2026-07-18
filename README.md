@@ -1,6 +1,7 @@
 # FurlPay Browser Extension
 
 MV3 extension (Chrome / Edge / Firefox via [WXT](https://wxt.dev) + React + TypeScript).
+<img width="497" height="767" alt="image" src="https://github.com/user-attachments/assets/d345da75-f72a-430d-9207-a761652adb38" />
 
 ## Features
 
