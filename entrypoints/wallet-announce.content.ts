@@ -41,7 +41,11 @@ const ICON =
   );
 
 export default defineContentScript({
-  matches: ["<all_urls>"],
+  // Dapps live on the web, and a wallet provider belongs only on an origin the
+  // network cannot rewrite: over plain http an active MITM can serve script
+  // that drives this provider, so we simply do not announce there. Narrowest
+  // scope per CWS Limited Use (Aug 2026).
+  matches: ["https://*/*"],
   world: "MAIN",
   runAt: "document_start",
   main() {
@@ -91,7 +95,11 @@ export default defineContentScript({
       const id = crypto.randomUUID();
       return new Promise<string[]>((resolve, reject) => {
         pending.set(id, { resolve, reject });
-        window.postMessage({ source: BRIDGE_REQUEST, id, method: "connect" }, "*");
+        // Targeted at this document's own origin, not "*": the isolated-world
+        // bridge lives in this same window, so nothing legitimate needs a
+        // wildcard, and a wildcard would let a cross-origin frame observe the
+        // connect handshake.
+        window.postMessage({ source: BRIDGE_REQUEST, id, method: "connect" }, window.location.origin);
         setTimeout(() => {
           if (pending.delete(id)) reject(rpcError(4001, "Connection request timed out."));
         }, CONNECT_TIMEOUT_MS);

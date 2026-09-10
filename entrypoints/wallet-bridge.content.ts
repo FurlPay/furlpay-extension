@@ -10,7 +10,11 @@ const BRIDGE_REQUEST = "furlpay-wallet";
 const BRIDGE_RESULT = "furlpay-wallet-result";
 
 export default defineContentScript({
-  matches: ["<all_urls>"],
+  // Bridges the MAIN-world provider on secure pages only. Must stay in step
+  // with wallet-announce.content.ts: the provider is not announced over plain
+  // http, so nothing here should be reachable there either. Narrowest scope
+  // per CWS Limited Use (Aug 2026).
+  matches: ["https://*/*"],
   runAt: "document_start",
   main() {
     window.addEventListener("message", (event) => {
@@ -24,7 +28,13 @@ export default defineContentScript({
         .sendMessage({ type: "WALLET_CONNECT" })
         .catch((e): BgResponse => ({ ok: false, error: String(e) }))
         .then((res: BgResponse<{ accounts: string[] }>) => {
-          window.postMessage({ source: BRIDGE_RESULT, id: msg.id, ...res }, "*");
+          // Scoped to this document's origin, NOT "*": this payload carries the
+          // user's Safe address, and a wildcard would hand it to any
+          // cross-origin frame on the page listening for messages.
+          window.postMessage(
+            { source: BRIDGE_RESULT, id: msg.id, ...res },
+            window.location.origin
+          );
         });
     });
   },
