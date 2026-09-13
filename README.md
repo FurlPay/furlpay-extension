@@ -8,12 +8,9 @@
 ![Firefox](https://img.shields.io/badge/Firefox-FF7139?style=flat-square&logo=firefoxbrowser&logoColor=white)
 ![WebAuthn](https://img.shields.io/badge/WebAuthn-3423A6?style=flat-square)
 ![x402](https://img.shields.io/badge/x402-0052FF?style=flat-square)
-[![CI](https://github.com/FurlPay/furlpay-extension/actions/workflows/ci.yml/badge.svg)](https://github.com/FurlPay/furlpay-extension/actions/workflows/ci.yml)
 
 MV3 extension (Chrome / Edge / Firefox via [WXT](https://wxt.dev) + React + TypeScript).
 <img width="497" height="767" alt="image" src="https://github.com/user-attachments/assets/c1e07de6-8c1c-46f8-a1ea-338dd1ac693e" />
-
-
 
 ## Features
 
