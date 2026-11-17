@@ -1,5 +1,26 @@
-import { apiFetch, getBaseUrl, toResponse } from "@/lib/api";
+import { ApiError, apiFetch, getBaseUrl, toResponse } from "@/lib/api";
+import { isTrustedCheckoutUrl, type HostedCheckout, type RampQuote } from "@/lib/ramp";
+import { isStepUpCode, maskEmail } from "@/lib/stepUp";
+import { flush as flushAnalytics, track } from "@/lib/analytics";
+import {
+  NO_LINKED_WALLET_ERROR,
+  payableAddressFrom,
+  type LinkStatusResponse,
+  type PayableAddress,
+} from "@/lib/receiveAddress";
 import { BADGE_BALANCE_KEY, badgeTextFor } from "@/lib/badge";
+// The consent gate — the logic deciding whether a web page learns the user's
+// Safe address — lives in lib/originGrants.ts so it can be tested. The key, the
+// 30-day TTL and the 100-origin cap are owned there too, so there is one
+// definition of each rather than a copy that can drift.
+import {
+  allowedOrigins as allowedOriginsOf,
+  ALLOWED_ORIGINS_KEY,
+  originGranted as originGrantedIn,
+  rememberOrigin as rememberOriginIn,
+  senderOrigin,
+  type OriginStore,
+} from "@/lib/originGrants";
 import type {
   BarsResponse,
   BgRequest,
@@ -20,6 +41,10 @@ import type {
   X402Detection,
 } from "@/lib/types";
 import { checkoutParams, sanitizeDetection } from "@/lib/x402Trust";
+import { messageAllowed } from "@/lib/messageGate";
+
+/** `chrome-extension://<id>/` (or `moz-extension://<uuid>/`). */
+const extensionBase = () => browser.runtime.getURL("/");
 
 // ---------------------------------------------------------------------------
 // FurlPay service worker (MV3).
@@ -49,13 +74,10 @@ const DEPOSITS_KEY = "notifiedDeposits";
 // before WALLET_CONNECT resolves — without it, any open website could silently
 // learn the user's Safe address (a wallet-fingerprinting / deanonymization
 // vector), which is why every real wallet gates connect behind a click.
-const ALLOWED_ORIGINS_KEY = "walletAllowedOrigins";
-const MAX_ALLOWED_ORIGINS = 100;
 /** How long a granted origin stays remembered. A site the user connected to
  *  once is not a site they trust forever: domains change hands and dapps get
  *  compromised, and a grant with no expiry means yesterday's approval still
  *  hands out the Safe address today. Re-consent is one click. */
-const ORIGIN_GRANT_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 /** Pending consent prompts, keyed by request id. MV3 workers are ephemeral,
  *  but the open sendResponse channel (`return true`) keeps this worker alive
@@ -89,17 +111,26 @@ async function repaintBadge(): Promise<void> {
 }
 
 export default defineBackground(() => {
-  browser.runtime.onInstalled.addListener(() => {
+  browser.runtime.onInstalled.addListener((details) => {
+    // Versions before 8 Oct 2026 persisted x402Log in storage.local; drop it.
+    void browser.storage.local.remove("x402Log").catch(() => undefined);
     browser.alarms.create(POLL_ALARM, { periodInMinutes: 1 });
     void poll();
+    if (details?.reason === "install") void track("extension_installed");
   });
   browser.runtime.onStartup.addListener(() => {
     browser.alarms.create(POLL_ALARM, { periodInMinutes: 1 });
     void poll();
+    void track("extension_started");
   });
 
   browser.alarms.onAlarm.addListener((alarm) => {
-    if (alarm.name === POLL_ALARM) void poll();
+    if (alarm.name !== POLL_ALARM) return;
+    void poll();
+    // Analytics rides the existing alarm: no extra wake-ups, and a failure
+    // here never touches polling (flush swallows nothing it should not, but
+    // nothing it does can throw into the extension).
+    void flushAnalytics().catch(() => undefined);
   });
 
   // Flipping the badge preference must take effect now, not up to a minute
@@ -138,10 +169,17 @@ export default defineBackground(() => {
   });
 
   browser.runtime.onMessage.addListener((message: BgRequest, sender, sendResponse) => {
-    // Only trust our own extension surfaces (popup/sidepanel/content scripts).
-    if (sender.id !== browser.runtime.id) return;
+    // Our own surfaces only, and content scripts only for their three types
+    // (lib/messageGate.ts — a content script shares this extension's id).
+    if (!messageAllowed(message?.type, sender, browser.runtime.id, extensionBase())) {
+      if (sender.id === browser.runtime.id) sendResponse({ ok: false, error: "Not permitted from this context." });
+      return;
+    }
 
     switch (message.type) {
+      case "GET_RECEIVE_ADDRESS":
+        void toResponse(fetchPayableAddress()).then(sendResponse);
+        return true;
       case "GET_OVERVIEW":
         void toResponse(apiFetch<Overview>("/api/overview")).then(sendResponse);
         return true;
@@ -155,6 +193,9 @@ export default defineBackground(() => {
             body: JSON.stringify({ challengeId: message.challengeId, decision: "declined" }),
           })
         ).then(sendResponse);
+        return true;
+      case "GET_HELD_PAYMENTS":
+        void toResponse(apiFetch<unknown>("/api/control-plane/approvals")).then(sendResponse);
         return true;
       case "OPEN_APPROVE":
         void openApprovePage(message.challengeId).then(() => sendResponse({ ok: true, data: null }));
@@ -185,6 +226,72 @@ export default defineBackground(() => {
           }).then(async (r) => {
             if (r.url) await browser.tabs.create({ url: r.url });
             return r;
+          })
+        ).then(sendResponse);
+        return true;
+      case "RAMP_QUOTE":
+        void toResponse(
+          apiFetch<RampQuote>("/api/onramp/quote", {
+            method: "POST",
+            body: JSON.stringify({
+              fiatAmount: message.fiatAmount,
+              fiatCurrency: message.fiatCurrency,
+              token: "USDC",
+              chain: message.chain,
+              paymentMethod: "card",
+            }),
+          })
+        ).then(sendResponse);
+        return true;
+      case "RAMP_CHECKOUT":
+        void toResponse(
+          (message.direction === "buy"
+            ? apiFetch<{ hosted: HostedCheckout | null; flags?: string[] }>("/api/onramp/session", {
+                method: "POST",
+                body: JSON.stringify({
+                  fiatAmount: message.amount,
+                  fiatCurrency: message.fiatCurrency,
+                  token: "USDC",
+                  chain: message.chain,
+                  paymentMethod: "card",
+                  destinationAddress: message.address,
+                }),
+              })
+            : apiFetch<{ hosted: HostedCheckout | null; flags?: string[] }>("/api/offramp/session", {
+                method: "POST",
+                body: JSON.stringify({ address: message.address, chain: message.chain, token: "USDC", cryptoAmount: message.amount }),
+              })
+          ).then(async (r) => {
+            if (!r.hosted) throw new Error("not_available");
+            // Never open a tab on a URL that is not Coinbase's checkout (lib/ramp.ts).
+            if (!isTrustedCheckoutUrl(r.hosted.url)) throw new Error("untrusted_checkout_url");
+            await browser.tabs.create({ url: r.hosted.url });
+            return { opened: true as const, flags: r.flags ?? [] };
+          })
+        ).then(sendResponse);
+        return true;
+      case "STEP_UP_SEND":
+        void toResponse(
+          apiFetch<{ email?: string | null }>("/api/profile").then(async (p) => {
+            if (!p.email) throw new Error("no_email");
+            await apiFetch("/api/auth/otp/start", { method: "POST", body: JSON.stringify({ to: p.email, channel: "email" }) });
+            return { sentTo: maskEmail(p.email) };
+          })
+        ).then(sendResponse);
+        return true;
+      case "STEP_UP_VERIFY":
+        // A successful check issues a fresh session cookie for furlpay.com with
+        // the step-up recorded on it (apps/web lib/stepup.ts). The email is
+        // re-read from the profile, never taken from the popup.
+        void toResponse(
+          apiFetch<{ email?: string | null }>("/api/profile").then(async (p) => {
+            if (!p.email) throw new Error("no_email");
+            if (!isStepUpCode(message.code)) throw new Error("bad_code");
+            await apiFetch("/api/auth/otp/check", {
+              method: "POST",
+              body: JSON.stringify({ to: p.email, code: message.code, channel: "email", login: true }),
+            });
+            return { verified: true as const };
           })
         ).then(sendResponse);
         return true;
@@ -245,7 +352,15 @@ export default defineBackground(() => {
         ).then(sendResponse);
         return true;
       case "LOGOUT":
-        void toResponse(apiFetch("/api/auth/logout", { method: "POST" })).then(sendResponse);
+        // Grants, display snapshots, and notification de-duplication belong to
+        // the signed-in account. Leaving any of them behind lets the next
+        // account on this browser inherit a dapp's wallet-connect consent.
+        void toResponse(
+          apiFetch("/api/auth/logout", { method: "POST" }).then(async (result) => {
+            await clearAccountState();
+            return result;
+          })
+        ).then(sendResponse);
         return true;
       case "GET_PASSKEYS":
         void toResponse(apiFetch<PasskeyList>("/api/auth/passkey/credentials")).then(sendResponse);
@@ -259,6 +374,7 @@ export default defineBackground(() => {
         ).then(sendResponse);
         return true;
       case "TRAVEL_SEARCH":
+        void track("travel_search", { source: "extension" });
         void toResponse(
           apiFetch("/api/travel/search", { method: "POST", body: JSON.stringify(message.payload) })
         ).then(sendResponse);
@@ -289,10 +405,18 @@ export default defineBackground(() => {
         sendResponse({ ok: true, data: null });
         return false;
       }
-      case "X402_DETECTED":
-        void onX402Detected(message.detection);
+      case "X402_DETECTED": {
+        // The isolated-world relay is fed by window.postMessage, so validate
+        // again at the worker boundary before storing page-controlled data.
+        const detected = sanitizeDetection(message.detection);
+        if (!detected) {
+          sendResponse({ ok: false, error: "Invalid x402 detection." });
+          return false;
+        }
+        void onX402Detected(detected);
         sendResponse({ ok: true, data: null });
         return false;
+      }
       case "OPEN_X402_CHECKOUT":
         // `sender` carries the real page origin — the only part of this flow the
         // page cannot forge. See openX402Checkout.
@@ -305,59 +429,53 @@ export default defineBackground(() => {
 
 // --- wallet connect consent ----------------------------------------------
 
-/** Page origin of a relayed connect request. Chrome sets sender.origin for
- *  content-script messages; Firefox exposes only sender.url — parse it. */
-function senderOrigin(sender: { origin?: string; url?: string }): string | null {
-  if (sender.origin && sender.origin !== "null") return sender.origin;
+// The consent gate itself lives in lib/originGrants.ts so it can be tested:
+// these are the functions that decide whether an arbitrary web page learns the
+// user's Safe address, and as private functions here they had no coverage. The
+// thin wrappers below bind them to browser.storage.local.
+//
+// `store` is the injected slice of extension storage. browser.storage.local's
+// get/set already match the OriginStore shape, so this is a direct pass-through
+// rather than an adapter.
+const store: OriginStore = {
+  get: (key) => browser.storage.local.get(key) as Promise<Record<string, unknown>>,
+  set: (items) => browser.storage.local.set(items),
+};
+
+const allowedOrigins = () => allowedOriginsOf(store);
+const originGranted = (origin: string) => originGrantedIn(store, origin);
+const rememberOrigin = (origin: string) => rememberOriginIn(store, origin);
+
+/** The user's VERIFIED linked wallet (GET /api/wallet/link), or the reason
+ *  there is none. Never falls back to anything address-shaped: the account's
+ *  placeholder address has no key (lib/receiveAddress.ts). Throws ApiError on
+ *  transport/auth failure so callers can tell "signed out" from "no wallet". */
+async function fetchPayableAddress(): Promise<PayableAddress> {
   try {
-    return sender.url ? new URL(sender.url).origin : null;
-  } catch {
-    return null;
+    return payableAddressFrom(await apiFetch<LinkStatusResponse>("/api/wallet/link"));
+  } catch (e) {
+    // 404 not_enabled: linking is switched off on this deployment.
+    if (e instanceof ApiError && e.status === 404) return { ok: false, reason: "linking_disabled" };
+    throw e;
   }
 }
 
-async function allowedOrigins(): Promise<Record<string, number>> {
-  const stored = await browser.storage.local.get(ALLOWED_ORIGINS_KEY);
-  const val = stored[ALLOWED_ORIGINS_KEY];
-  return val && typeof val === "object" ? (val as Record<string, number>) : {};
-}
-
-/** Is this origin currently granted? Expired grants are treated as absent and
- *  swept from storage, so the next connect goes through the consent prompt. */
-async function originGranted(origin: string): Promise<boolean> {
-  const allowed = await allowedOrigins();
-  const grantedAt = allowed[origin];
-  if (typeof grantedAt !== "number") return false;
-  if (Date.now() - grantedAt <= ORIGIN_GRANT_TTL_MS) return true;
-
-  const fresh = Object.fromEntries(
-    Object.entries(allowed).filter(([, at]) => Date.now() - at <= ORIGIN_GRANT_TTL_MS)
-  );
-  await browser.storage.local.set({ [ALLOWED_ORIGINS_KEY]: fresh });
-  return false;
-}
-
-async function rememberOrigin(origin: string): Promise<void> {
-  const allowed = await allowedOrigins();
-  allowed[origin] = Date.now();
-  // Bound storage: keep the most recently granted origins.
-  const entries = Object.entries(allowed)
-    .sort((a, b) => a[1] - b[1])
-    .slice(-MAX_ALLOWED_ORIGINS);
-  await browser.storage.local.set({ [ALLOWED_ORIGINS_KEY]: Object.fromEntries(entries) });
-}
-
-/** Resolve the Safe address for an approved connect. Signed out → open login
- *  so the user can authenticate, and let the dapp's request fail cleanly. */
+/** Resolve the account for an approved connect: the verified linked wallet
+ *  only. No link → NO_LINKED_WALLET (the page provider maps it to EIP-1193
+ *  4100) and the app's wallet setup is the remedy. Signed out → open login so
+ *  the user can authenticate, and let the dapp's request fail cleanly. */
 async function resolveAccounts(): Promise<BgResponse<{ accounts: string[] }>> {
-  const res = await toResponse(
-    apiFetch<{ safeAddress: string }>("/api/wallets").then((w) => ({ accounts: [w.safeAddress] }))
-  );
-  if (!res.ok) {
-    const base = await getBaseUrl();
-    void browser.tabs.create({ url: `${base}/login` });
+  try {
+    const payable = await fetchPayableAddress();
+    if (!payable.ok) return { ok: false, error: NO_LINKED_WALLET_ERROR };
+    return { ok: true, data: { accounts: [payable.address] } };
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 401) {
+      const base = await getBaseUrl();
+      void browser.tabs.create({ url: `${base}/login` });
+    }
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
-  return res as BgResponse<{ accounts: string[] }>;
 }
 
 async function connectWithConsent(
@@ -406,6 +524,8 @@ async function resolveConnectDecision(requestId: string, allow: boolean): Promis
     for (const [, p] of settled) p.respond({ ok: false, error: "Connection request was rejected." });
     return;
   }
+  // The decision, never the site: the dapp origin is not sent anywhere.
+  void track("extension_connected", { source: "dapp_consent" });
   await rememberOrigin(entry.origin);
   const res = await resolveAccounts();
   for (const [, p] of settled) p.respond(res);
@@ -419,6 +539,18 @@ async function sessionState(): Promise<{ authenticated: boolean; name?: string; 
   } catch {
     return { authenticated: false, baseUrl };
   }
+}
+
+async function clearAccountState(): Promise<void> {
+  for (const [, pending] of pendingConnects) {
+    pending.respond({ ok: false, error: "Signed out before the connection request was completed." });
+  }
+  pendingConnects.clear();
+  await Promise.all([
+    browser.storage.session.remove(["cachedOverview", "cachedChallenges"]),
+    browser.storage.local.remove([ALLOWED_ORIGINS_KEY, NOTIFIED_KEY, DEPOSITS_KEY]),
+    action().setBadgeText({ text: "" }),
+  ]).catch(() => undefined);
 }
 
 /** Refresh badge (net worth across all assets) and surface any new 3DS challenges. */
@@ -514,6 +646,7 @@ async function openApprovePage(challengeId?: string): Promise<void> {
 }
 
 async function declineChallenge(challengeId: string): Promise<void> {
+  void track("transaction_rejected", { source: "card_challenge" });
   try {
     await apiFetch("/api/cards/challenges/verify", {
       method: "POST",
@@ -539,11 +672,13 @@ async function declineChallenge(challengeId: string): Promise<void> {
 
 async function onX402Detected(detection: X402Detection): Promise<void> {
   // Rolling log for the DevTools inspector and popup indicator, deduped by
-  // resource URL (a page retrying a 402 shouldn't flood the log).
-  const { x402Log } = await browser.storage.local.get("x402Log");
+  // resource URL (a page retrying a 402 shouldn't flood the log). It is a slice
+  // of the user's browsing history, so it lives in storage.session: memory-only,
+  // cleared when the browser closes, unreadable by content scripts.
+  const { x402Log } = await browser.storage.session.get("x402Log");
   const log: X402Detection[] = Array.isArray(x402Log) ? x402Log : [];
   const deduped = [detection, ...log.filter((d) => d.url !== detection.url)];
-  await browser.storage.local.set({ x402Log: deduped.slice(0, 50) });
+  await browser.storage.session.set({ x402Log: deduped.slice(0, 50) });
 }
 
 /** Opens the furlpay.com checkout for a detected 402.
@@ -575,5 +710,7 @@ async function openX402Checkout(
 
   // Settlement + passkey signing happen on furlpay.com (the rpID origin), which
   // verifies the 402 against `resource` before it displays a recipient or amount.
-  await browser.tabs.create({ url: `${base}/developer?x402=${encodeURIComponent(params.toString())}` });
+  // /pay/x402 re-reads the 402 server-side and shows what the RESOURCE asks for;
+  // the link carries only the resource URL and the browser-verified origin.
+  await browser.tabs.create({ url: `${base}/pay/x402?${params.toString()}` });
 }

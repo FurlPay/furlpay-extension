@@ -26,7 +26,10 @@ export interface Transaction {
 }
 
 export interface Overview {
-  user: { id: string; name: string; safeAddress: string; kycStatus: string; region: string; tier: string };
+  // No safeAddress here on purpose: the API still sends it, but it is a keyless
+  // placeholder and must never be rendered or returned as a wallet address.
+  // Leaving it out of the type turns any use into a compile error (P0-3).
+  user: { id: string; name: string; kycStatus: string; region: string; tier: string };
   netWorth: number;
   breakdown: { crypto: number; fiat: number; equities: number };
   tokenBalances: TokenBalance[];
@@ -272,7 +275,6 @@ export interface PasskeyInfo {
 
 export interface PasskeyList {
   credentials: PasskeyInfo[];
-  safeAddress: string;
 }
 
 /** x402 PaymentRequirements captured from a 402 response (x402 v1 shape). */
@@ -299,15 +301,25 @@ export interface X402Detection {
 // Message protocol between UI surfaces and the background service worker.
 export type BgRequest =
   | { type: "GET_OVERVIEW" }
+  // The verified linked wallet only (lib/receiveAddress.ts). Never safeAddress.
+  | { type: "GET_RECEIVE_ADDRESS" }
   | { type: "GET_CHALLENGES" }
   | { type: "DECLINE_CHALLENGE"; challengeId: string }
   | { type: "OPEN_APPROVE"; challengeId?: string }
+  // Held agent payments (lib/heldPayments.ts). Read-only: deciding happens on furlpay.com.
+  | { type: "GET_HELD_PAYMENTS" }
   | { type: "GET_REWARDS" }
   | { type: "GET_TRANSACTIONS" }
   | { type: "GET_BARS"; symbol: string; tf: string }
   | { type: "GET_ENTITLEMENTS" }
   | { type: "UPGRADE_PLAN"; plan: "pro" | "developer" }
   | { type: "GET_EARN" }
+  // Buy / sell crypto (lib/ramp.ts). Quote is public; checkout opens Coinbase in a new tab.
+  | { type: "RAMP_QUOTE"; fiatAmount: number; fiatCurrency: string; chain: string }
+  | { type: "RAMP_CHECKOUT"; direction: "buy" | "sell"; amount: number; fiatCurrency: string; chain: string; address: string }
+  // Step-up (lib/stepUp.ts): a code to the account's OWN email, read server-side.
+  | { type: "STEP_UP_SEND" }
+  | { type: "STEP_UP_VERIFY"; code: string }
   | { type: "GET_MARKETS"; kind?: "stock" | "etf" | "crypto"; q?: string; limit?: number }
   | { type: "GET_MARKET_DETAIL"; symbol: string }
   | { type: "SEARCH_MARKETS"; q?: string; kind?: "stock" | "etf" | "crypto"; limit?: number }

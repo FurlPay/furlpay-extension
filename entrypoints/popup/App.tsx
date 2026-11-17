@@ -1,17 +1,18 @@
 import { useCallback, useEffect, useState } from "react";
-import { Icon, IconName, LogoMark, Wordmark } from "@/components/icons";
+import { Icon, type IconName, LogoMark, Wordmark } from "@/components/icons";
 import type { PendingChallenge } from "@/lib/types";
 import ActivityTab from "./components/ActivityTab";
 import ApprovalsTab from "./components/ApprovalsTab";
 import EarnTab from "./components/EarnTab";
 import MarketsTab from "./components/MarketsTab";
 import TravelTab from "./components/TravelTab";
+import RampPanel from "./components/RampPanel";
 import NotificationCenter from "./components/NotificationCenter";
 import { Onboarding, useOnboarding } from "./components/Onboarding";
 import SettingsTab from "./components/SettingsTab";
 import SignedOut from "./components/SignedOut";
 import WalletTab from "./components/WalletTab";
-import { SessionState, SkeletonPage, Tab, openSite, send } from "./components/shared";
+import { type SessionState, SkeletonPage, type Tab, openSite, send } from "./components/shared";
 
 // FurlPay popup — the daily surface of the On-Chain Financial OS.
 // Wallet / Activity / Approve / Earn / Settings. All data flows through the
@@ -22,6 +23,7 @@ import { SessionState, SkeletonPage, Tab, openSite, send } from "./components/sh
 export default function App() {
   const [tab, setTab] = useState<Tab>("wallet");
   const [travelOpen, setTravelOpen] = useState(false);
+  const [rampOpen, setRampOpen] = useState(false);
   const [session, setSession] = useState<SessionState | null>(null);
   const [pendingCount, setPendingCount] = useState(0);
   const [bellOpen, setBellOpen] = useState(false);
@@ -114,12 +116,14 @@ export default function App() {
                 bar is already at six in a ~380px popup, and travel is an
                 occasional errand, not a daily surface. */}
             {tab === "wallet" && travelOpen && <TravelTab onBack={() => setTravelOpen(false)} />}
-            {tab === "wallet" && !travelOpen && (
+            {tab === "wallet" && rampOpen && !travelOpen && <RampPanel onBack={() => setRampOpen(false)} />}
+            {tab === "wallet" && !travelOpen && !rampOpen && (
               <WalletTab
                 name={session.name}
                 onQuickAction={(path) => {
                   if (path === "/investing") return setTab("markets");
                   if (path === "/travel") return setTravelOpen(true);
+                  if (path === "/ramp") return setRampOpen(true);
                   return openSite(path);
                 }}
               />
