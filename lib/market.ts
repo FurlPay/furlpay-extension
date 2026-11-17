@@ -1,4 +1,5 @@
-import type { PendingChallenge } from "./types";
+import { isPlausibleSeries } from "./candles";
+import type { BarsResponse, PendingChallenge } from "./types";
 
 // ---------------------------------------------------------------------------
 // Presentation-layer market helpers.
@@ -199,6 +200,26 @@ export function blendSeries(parts: { series: number[]; weight: number }[]): numb
     for (let i = 0; i < n; i++) out[i] += (s[i] * p.weight) / total;
   }
   return out;
+}
+
+export interface ChartSeries {
+  series: number[];
+  hasSyntheticData: boolean;
+}
+
+/** Preserve the fallback's provenance when the market feed has no usable history. */
+export function chartSeriesFromBars(bars: BarsResponse | null, fallback: number[]): ChartSeries {
+  const closes = bars?.candles?.map((c) => c.close) ?? [];
+  const normalized = normalizeCloses(closes);
+  if (isPlausibleSeries(normalized)) return { series: normalized, hasSyntheticData: false };
+  return { series: fallback, hasSyntheticData: true };
+}
+
+export function blendChartSeries(parts: (ChartSeries & { weight: number })[]): ChartSeries {
+  return {
+    series: blendSeries(parts),
+    hasSyntheticData: parts.some((part) => part.weight !== 0 && part.hasSyntheticData),
+  };
 }
 
 /** SVG polyline points string for a sparkline of the given box size. */

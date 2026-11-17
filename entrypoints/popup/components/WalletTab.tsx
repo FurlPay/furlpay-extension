@@ -6,17 +6,18 @@ import {
   RANGES,
   RANGE_PERIOD_LABEL,
   Range,
-  blendSeries,
+  blendChartSeries,
   changePct,
-  normalizeCloses,
+  chartSeriesFromBars,
   seriesFor,
   seriesTimes,
   sparklinePoints,
   timeLabel,
   tokenAmount,
   tokenMeta,
+  type ChartSeries,
 } from "@/lib/market";
-import { deriveCandles, isPlausibleSeries, type Candle } from "@/lib/candles";
+import { deriveCandles, type Candle } from "@/lib/candles";
 import type { BarsResponse, Overview, PendingChallenge, RewardsSummary, TokenBalance } from "@/lib/types";
 import {
   EmptyState,
@@ -42,6 +43,7 @@ const QUICK_ACTIONS: { icon: IconName; label: string; path?: string; action?: "r
 /** Privacy mode (Rabby-style): balances render as bullets, persisted. */
 const PRIVACY_KEY = "furlpay-privacy";
 const MASK = "••••.••";
+const EMPTY_BALANCES: TokenBalance[] = [];
 
 export default function WalletTab({ name, onQuickAction }: { name?: string; onQuickAction: (path: string) => void }) {
   const [overview, setOverview] = useState<Overview | null>(null);
@@ -98,7 +100,10 @@ export default function WalletTab({ name, onQuickAction }: { name?: string; onQu
       .finally(load);
   }, [load]);
 
-  const portfolioSeries = usePortfolioSeries(overview?.tokenBalances ?? [], range);
+  const { series: portfolioSeries, hasSyntheticData: illustrativePortfolio } = usePortfolioSeries(
+    overview?.tokenBalances ?? EMPTY_BALANCES,
+    range
+  );
   const portfolioChange = portfolioSeries.length ? changePct(portfolioSeries) : 0;
   const animated = useCountUp(overview?.netWorth ?? 0);
 
@@ -126,13 +131,15 @@ export default function WalletTab({ name, onQuickAction }: { name?: string; onQu
           {greeting()}
           {firstName ? `, ${firstName}` : ""}
         </div>
-        <div style={{ fontSize: "0.72rem", color: "var(--fp-text-secondary)" }}>
-          You're {portfolioChange >= 0 ? "up" : "down"}{" "}
-          <span className={portfolioChange >= 0 ? "gain" : "loss"} style={{ fontWeight: 700 }}>
-            {Math.abs(portfolioChange).toFixed(2)}%
-          </span>{" "}
-          {RANGE_PERIOD_LABEL[range].toLowerCase()}
-        </div>
+        {!illustrativePortfolio && (
+          <div style={{ fontSize: "0.72rem", color: "var(--fp-text-secondary)" }}>
+            You're {portfolioChange >= 0 ? "up" : "down"}{" "}
+            <span className={portfolioChange >= 0 ? "gain" : "loss"} style={{ fontWeight: 700 }}>
+              {Math.abs(portfolioChange).toFixed(2)}%
+            </span>{" "}
+            {RANGE_PERIOD_LABEL[range].toLowerCase()}
+          </div>
+        )}
       </div>
 
       {/* Portfolio card */}
@@ -173,11 +180,17 @@ export default function WalletTab({ name, onQuickAction }: { name?: string; onQu
         </div>
         <div className="balance-amount" aria-live="polite">${privacy ? MASK : usd(animated)}</div>
         <div style={{ fontSize: "0.72rem", marginTop: 1 }}>
-          <span style={{ color: "var(--fp-text-muted)" }}>{RANGE_PERIOD_LABEL[range]} </span>
-          <span className={portfolioChange >= 0 ? "gain" : "loss"} style={{ fontWeight: 700 }}>
-            {portfolioChange >= 0 ? "+" : "-"}${money(Math.abs(absChange))} ({portfolioChange >= 0 ? "+" : ""}
-            {portfolioChange.toFixed(2)}%)
-          </span>
+          {illustrativePortfolio ? (
+            <span style={{ color: "var(--fp-warning)" }}>Illustrative chart · Includes simulated prices</span>
+          ) : (
+            <>
+              <span style={{ color: "var(--fp-text-muted)" }}>{RANGE_PERIOD_LABEL[range]} </span>
+              <span className={portfolioChange >= 0 ? "gain" : "loss"} style={{ fontWeight: 700 }}>
+                {portfolioChange >= 0 ? "+" : "-"}${money(Math.abs(absChange))} ({portfolioChange >= 0 ? "+" : ""}
+                {portfolioChange.toFixed(2)}%)
+              </span>
+            </>
+          )}
         </div>
         {chartType === "candle" ? (
           <CandleChart key={`c-${range}`} series={portfolioSeries} range={range} scale={scale} privacy={privacy} />
@@ -362,79 +375,60 @@ function ReceiveSheet({ address, onClose }: { address: string; onClose: () => vo
   );
 }
 
-/**
- * Live bars when they are usable, deterministic synthetic otherwise.
- *
- * The plausibility gate is load-bearing: /api/markets/bars is a market feed, and
- * asked for a stablecoin symbol it can return an unrelated instrument or a
- * near-zero first close. normalizeCloses() divides by that first close, so the
- * result peaked in the thousands and the portfolio card rendered
- * "H $2,476,953.80" on a $19,448 portfolio. Bad data now falls back instead of
- * poisoning the axis.
- */
-function liveSeriesOr(bars: BarsResponse | null, seed: string, range: Range, volatility: number): number[] {
-  const closes = bars?.candles?.map((c) => c.close) ?? [];
-  if (closes.length >= 2) {
-    const normalized = normalizeCloses(closes);
-    if (isPlausibleSeries(normalized)) return normalized;
-  }
-  return seriesFor(seed, range, volatility);
-}
+type ResolvedChartSeries = { fallback: ChartSeries; result: ChartSeries };
 
 /** Fetch real bars for one symbol; fall back to the deterministic synthetic. */
-function useAssetSeries(token: string, chain: string, range: Range): number[] {
+function useAssetSeries(token: string, chain: string, range: Range): ChartSeries {
   const meta = tokenMeta(token);
-  const synthetic = useMemo(
-    () => seriesFor(`${token}:${chain}`, range, meta.volatility),
+  const fallback = useMemo(
+    () => ({ series: seriesFor(`${token}:${chain}`, range, meta.volatility), hasSyntheticData: true }),
     [token, chain, range, meta.volatility]
   );
-  const [series, setSeries] = useState(synthetic);
+  const [resolved, setResolved] = useState<ResolvedChartSeries>();
   useEffect(() => {
-    setSeries(synthetic);
     let alive = true;
     send<BarsResponse>({ type: "GET_BARS", symbol: meta.symbol, tf: range }).then((r) => {
-      if (alive) setSeries(liveSeriesOr(r.ok ? r.data : null, `${token}:${chain}`, range, meta.volatility));
+      if (alive) setResolved({ fallback, result: chartSeriesFromBars(r.ok ? r.data : null, fallback.series) });
     });
     return () => {
       alive = false;
     };
-  }, [meta.symbol, range, synthetic]);
-  return series;
+  }, [meta.symbol, range, fallback]);
+  return resolved?.fallback === fallback ? resolved.result : fallback;
 }
 
 /** Portfolio index = per-asset series (real where available) blended by USD weight. */
-function usePortfolioSeries(balances: TokenBalance[], range: Range): number[] {
-  const synthetic = useMemo(
-    () =>
-      blendSeries(
-        balances.map((b) => ({
-          weight: b.usdValue,
-          series: seriesFor(`${b.token}:${b.chain}`, range, tokenMeta(b.token).volatility),
-        }))
-      ),
+function usePortfolioSeries(balances: TokenBalance[], range: Range): ChartSeries {
+  const assets = useMemo(
+    () => balances.map((b) => ({
+      symbol: b.token.toUpperCase(),
+      weight: b.usdValue,
+      series: seriesFor(`${b.token}:${b.chain}`, range, tokenMeta(b.token).volatility),
+      hasSyntheticData: true,
+    })),
     [balances, range]
   );
-  const [series, setSeries] = useState(synthetic);
+  const fallback = useMemo(() => blendChartSeries(assets), [assets]);
+  const [resolved, setResolved] = useState<ResolvedChartSeries>();
   useEffect(() => {
-    setSeries(synthetic);
-    if (balances.length === 0) return;
+    if (assets.length === 0) return;
     let alive = true;
     Promise.all(
-      balances.map((b) =>
-        send<BarsResponse>({ type: "GET_BARS", symbol: b.token.toUpperCase(), tf: range }).then((r) => ({
-          weight: b.usdValue,
-          series:
-            liveSeriesOr(r.ok ? r.data : null, `${b.token}:${b.chain}`, range, tokenMeta(b.token).volatility),
+      assets.map((asset) =>
+        send<BarsResponse>({ type: "GET_BARS", symbol: asset.symbol, tf: range }).then((r) => ({
+          weight: asset.weight,
+          ...chartSeriesFromBars(r.ok ? r.data : null, asset.series),
         }))
       )
     ).then((parts) => {
-      if (alive) setSeries(blendSeries(parts));
+      if (alive) setResolved({ fallback, result: blendChartSeries(parts) });
     });
     return () => {
       alive = false;
     };
-  }, [balances, range, synthetic]);
-  return series;
+  }, [assets, range, fallback]);
+  // A response only describes the inputs that produced its fallback.
+  return resolved?.fallback === fallback ? resolved.result : fallback;
 }
 
 /** Chart-type preference, persisted so the popup reopens the way you left it. */
@@ -618,12 +612,12 @@ function InteractiveChart({ series, range, scale, positive }: { series: number[]
 
 function AssetRow({ token, chain, amount, usdValue, range, delay, privacy }: { token: string; chain: string; amount: number; usdValue: number; range: Range; delay: number; privacy: boolean }) {
   const meta = tokenMeta(token);
-  const series = useAssetSeries(token, chain, range);
+  const { series, hasSyntheticData } = useAssetSeries(token, chain, range);
   const change = changePct(series);
   // Stablecoins hold their peg: flat gray spark + neutral change, so rows
   // don't all wear the same green sawtooth.
   const stable = Math.abs(change) < 0.15;
-  const sparkColor = stable ? "var(--fp-text-muted)" : change >= 0 ? "var(--fp-gain)" : "var(--fp-loss)";
+  const sparkColor = stable || hasSyntheticData ? "var(--fp-text-muted)" : change >= 0 ? "var(--fp-gain)" : "var(--fp-loss)";
   return (
     <div className="asset-row fade-up" style={{ animationDelay: `${delay}s` }}>
       <div className="asset-logo" style={{ background: meta.logo ? undefined : meta.color }}>
@@ -654,9 +648,13 @@ function AssetRow({ token, chain, amount, usdValue, range, delay, privacy }: { t
         <div style={{ fontFamily: "var(--fp-font-mono)", fontWeight: 600, fontSize: "0.84rem" }}>
           ${privacy ? "••••.••" : usd(usdValue)}
         </div>
-        <div className={stable ? "" : change >= 0 ? "gain" : "loss"} style={{ fontSize: "0.7rem", fontWeight: 600, color: stable ? "var(--fp-text-muted)" : undefined }}>
-          {stable ? "0.00%" : `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`}
-        </div>
+        {hasSyntheticData ? (
+          <div style={{ fontSize: "0.7rem", color: "var(--fp-warning)" }}>Illustrative chart</div>
+        ) : (
+          <div className={stable ? "" : change >= 0 ? "gain" : "loss"} style={{ fontSize: "0.7rem", fontWeight: 600, color: stable ? "var(--fp-text-muted)" : undefined }}>
+            {stable ? "0.00%" : `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`}
+          </div>
+        )}
       </div>
     </div>
   );
