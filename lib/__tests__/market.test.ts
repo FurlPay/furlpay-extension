@@ -1,13 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
   assessChallenge,
+  blendChartSeries,
   changePct,
+  chartSeriesFromBars,
   compactMoney,
   mccLabel,
   normalizeCloses,
   seriesFor,
 } from "../market";
-import type { PendingChallenge } from "../types";
+import type { BarsResponse, PendingChallenge } from "../types";
 
 // assessChallenge drives the FurlPay Protect verdict shown on 3DS2 approval
 // cards — the copy a user reads before approving or declining a real charge.
@@ -105,5 +107,32 @@ describe("market utilities", () => {
     expect(mccLabel("7995")).toBeTruthy();
     expect(mccLabel("0000")).toBeNull();
     expect(mccLabel(undefined)).toBeNull();
+  });
+});
+
+describe("wallet chart data sources", () => {
+  const fallback = seriesFor("ETH:arbitrum", "1D", 0.04);
+
+  function bars(...closes: number[]): BarsResponse {
+    return { candles: closes.map((close, time) => ({ time, open: close, high: close, low: close, close })) };
+  }
+
+  it("keeps normalized market bars unlabelled when the feed succeeds", () => {
+    expect(chartSeriesFromBars(bars(100, 120), fallback)).toEqual({
+      series: [1, 1.2],
+      hasSyntheticData: false,
+    });
+  });
+
+  it.each([null, bars(), bars(100), bars(1, 100)])("marks the fallback when bars are unusable (%j)", (response) => {
+    expect(chartSeriesFromBars(response, fallback)).toEqual({ series: fallback, hasSyntheticData: true });
+  });
+
+  it("marks a portfolio that blends market bars with a weighted fallback", () => {
+    const market = chartSeriesFromBars(bars(100, 120), fallback);
+    const synthetic = chartSeriesFromBars(null, fallback);
+    expect(blendChartSeries([{ ...market, weight: 1 }, { ...synthetic, weight: 1 }]).hasSyntheticData).toBe(true);
+    expect(blendChartSeries([{ ...market, weight: 1 }, { ...synthetic, weight: 0 }]).hasSyntheticData).toBe(false);
+    expect(blendChartSeries([]).hasSyntheticData).toBe(false);
   });
 });
